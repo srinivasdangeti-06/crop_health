@@ -5,8 +5,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
 from groq import Groq
-import cv2
-from PIL import Image
+from PIL import Image, ImageFilter, ImageStat
 import io
 import base64
 from fpdf import FPDF
@@ -15,6 +14,9 @@ import re
 import os
 from dotenv import load_dotenv
 import httpx
+from skimage import color, filters, measure, morphology
+from skimage.transform import resize
+import colorsys
 
 # Load environment variables
 load_dotenv()
@@ -86,35 +88,39 @@ def parse_farm_data(text_content):
             data[key] = None
     return data
 
-# Function to analyze crop image (improved version)
+# Function to analyze crop image using PIL and scikit-image (no OpenCV)
 def analyze_crop_image(image):
     try:
-        # Convert image to numpy array
+        # Convert PIL image to numpy array
         img_array = np.array(image)
         
         # Basic image analysis
         if len(img_array.shape) == 3:
-            # Convert RGB to HSV for better color analysis
-            hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
+            # Convert RGB to HSV using colorsys for each pixel
+            h, w, _ = img_array.shape
+            hsv_image = np.zeros((h, w, 3))
             
-            # Multiple color ranges for different disease types
-            # Yellow/brown spots (common in many diseases)
-            lower_yellow = np.array([15, 50, 50])
-            upper_yellow = np.array([35, 255, 255])
-            yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+            for i in range(h):
+                for j in range(w):
+                    r, g, b = img_array[i, j, 0]/255.0, img_array[i, j, 1]/255.0, img_array[i, j, 2]/255.0
+                    hsv_image[i, j, 0], hsv_image[i, j, 1], hsv_image[i, j, 2] = colorsys.rgb_to_hsv(r, g, b)
             
-            # Brown/black spots (more severe)
-            lower_brown = np.array([0, 50, 20])
-            upper_brown = np.array([20, 255, 150])
-            brown_mask = cv2.inRange(hsv, lower_brown, upper_brown)
+            # Disease detection based on color analysis
+            # Yellow/brown colors indicate disease
+            yellow_mask = (hsv_image[:, :, 0] > 0.08) & (hsv_image[:, :, 0] < 0.15) & (hsv_image[:, :, 1] > 0.3)
+            brown_mask = (hsv_image[:, :, 0] > 0.05) & (hsv_image[:, :, 0] < 0.12) & (hsv_image[:, :, 1] > 0.4) & (hsv_image[:, :, 2] < 0.6)
             
-            # Combine masks
-            mask = cv2.bitwise_or(yellow_mask, brown_mask)
-            disease_percentage = (np.sum(mask > 0) / mask.size) * 100
+            # Calculate disease percentage
+            yellow_percentage = np.sum(yellow_mask) / (h * w) * 100
+            brown_percentage = np.sum(brown_mask) / (h * w) * 100
+            disease_percentage = yellow_percentage + brown_percentage
             
-            # Calculate health score based on green intensity
+            # Calculate green intensity (health indicator)
             green_channel = img_array[:, :, 1]
             green_intensity = np.mean(green_channel) / 255.0
+            
+            # Texture analysis using standard deviation
+            texture_score = np.std(green_channel)
             
             if disease_percentage > 20:
                 return "⚠️ Severe disease detected - Immediate action required", disease_percentage
@@ -123,10 +129,43 @@ def analyze_crop_image(image):
             elif disease_percentage > 3:
                 return "🟢 Minor issues detected - Monitor closely", disease_percentage
             else:
+                # Additional health check based on green intensity
+                if green_intensity < 0.4:
+                    return "🟡 Crop appears stressed - Check nutrients", disease_percentage
                 return "✅ Crop appears healthy - Good condition", disease_percentage
+                
         return "Unable to analyze image format", 0
     except Exception as e:
         return f"Error in analysis: {str(e)}", 0
+
+# Function to calculate health metrics from image
+def calculate_health_metrics(image):
+    """Calculate various health metrics from the crop image"""
+    try:
+        img_array = np.array(image)
+        if len(img_array.shape) != 3:
+            return {}
+        
+        # Calculate color metrics
+        r_channel = img_array[:, :, 0].mean()
+        g_channel = img_array[:, :, 1].mean()
+        b_channel = img_array[:, :, 2].mean()
+        
+        # Greenness index (normalized difference vegetation index approximation)
+        greenness = (g_channel - r_channel) / (g_channel + r_channel + 1e-6)
+        
+        # Calculate texture (variation)
+        texture = np.std(img_array[:, :, 1])
+        
+        return {
+            'greenness': greenness,
+            'texture_variation': texture,
+            'red_intensity': r_channel,
+            'green_intensity': g_channel,
+            'blue_intensity': b_channel
+        }
+    except:
+        return {}
 
 # Function to get LLM recommendations
 def get_recommendations(farm_data, model_choice="llama-3.3-70b-versatile"):
@@ -288,25 +327,40 @@ with tab3:
             image = Image.open(uploaded_image)
             st.image(image, caption="Uploaded Crop", width=300)
             
+            # Display image metrics
             if st.button("Analyze Crop"):
                 with st.spinner("Analyzing crop image..."):
+                    # Get analysis result
                     result, percentage = analyze_crop_image(image)
+                    
+                    # Calculate additional health metrics
+                    health_metrics = calculate_health_metrics(image)
+                    
                     st.subheader("Analysis Result")
                     
                     if "healthy" in result.lower() or "good condition" in result.lower():
                         st.success(result)
-                    elif "minor" in result.lower():
+                    elif "minor" in result.lower() or "stressed" in result.lower():
                         st.warning(result)
                     else:
                         st.error(result)
                     
+                    # Display metrics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Disease Probability", f"{percentage:.1f}%")
+                    with col2:
+                        st.metric("Greenness Index", f"{health_metrics.get('greenness', 0):.2f}")
+                    with col3:
+                        st.metric("Texture Variation", f"{health_metrics.get('texture_variation', 0):.1f}")
+                    
                     st.progress(min(percentage/100, 1.0))
-                    st.write(f"Disease probability: {percentage:.1f}%")
                     
                     # Get LLM advice for disease
                     if st.session_state.farm_data and client:
                         try:
                             prompt = f"""Based on {percentage:.1f}% disease detection in {st.session_state.farm_data.get('past_crop', 'crop')}, 
+                            with greenness index {health_metrics.get('greenness', 0):.2f}, 
                             provide:
                             1. Likely disease identification
                             2. Treatment recommendations
